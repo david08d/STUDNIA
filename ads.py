@@ -12,12 +12,14 @@
 """
 import asyncio
 import base64
+import hashlib
 import html
 import json
 import logging
 import os
 import re
 import statistics
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -476,15 +478,140 @@ def build_info(p, ai, shoes):
     return "\n".join(lines)
 
 
+# ====================================================================
+#  Постійний кеш відповіді Gemini (щоб не платити двічі за той самий товар)
+# ====================================================================
+
+# Піднімай число, коли міняєш listing_prompt, STYLE_EXAMPLE або формат відповіді:
+# старі кеші перестануть підходити, і Gemini відповість заново.
+PROMPT_VERSION = 1
+AI_CACHE_FILE = "ai_cache.json"     # лежить у папці товару: ads/<артикул>/ai_cache.json
+AI_CACHE_MAX_ENTRIES = 10           # стільки останніх варіантів тримаємо на один артикул
+
+_cache_file_lock = threading.Lock()        # запис файлу кешу: один потік за раз
+_key_locks = {}                            # ключ кешу -> замок генерації
+_key_locks_guard = threading.Lock()
+_AI_FIELDS = ("brand", "model_name", "kind", "type_gender", "color_title", "color_ua", "color_official",
+              "season", "material", "membrane", "path", "sizes", "keywords", "uncertain")
+
+
+def _key_lock(key):
+    with _key_locks_guard:
+        return _key_locks.setdefault(key, threading.Lock())
+
+
+def ai_cache_key(p, photo_hashes, model, prompt):
+    """Ключ кешу. Тут усе, від чого залежить відповідь Gemini:
+    версія промпту, артикул, назва зі складу й розміри (вони в тексті промпту), фото (їхній вміст
+    і порядок), модель. Хеш самого тексту промпту страхує, якщо забули піднять PROMPT_VERSION.
+    Коробка в промпт не входить (listing_prompt її не використовує), тому в ключі її немає.
+    Температура й json_mode незмінні в коді, ліміт токенів лише може обрізати відповідь,
+    а обрізані відповіді в кеш не потрапляють."""
+    parts = {
+        "prompt_version": PROMPT_VERSION,
+        "article": B.norm_article(p["article"]),
+        "model_name": p.get("model") or "",
+        "sizes": sorted(B.norm_size(x) for x in p["sizes"]),
+        "photos": list(photo_hashes) if photo_hashes else "nophoto",
+        "model": model,
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+    }
+    raw = json.dumps(parts, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def ai_valid(ai):
+    """Чи варта відповідь збереження: усі поля на місці й сказано хоча б тип товару та ключові слова."""
+    if not isinstance(ai, dict) or any(k not in ai for k in _AI_FIELDS):
+        return False
+    return bool(ai["type_gender"]) and bool(ai["keywords"]) and ai["kind"] in ("shoes", "clothes", "accessory", "other")
+
+
+def _cache_path(article):
+    return os.path.join(folder_for(article), AI_CACHE_FILE)
+
+
+def _cache_entries(path):
+    """Читає файл кешу. Якщо його немає чи він пошкоджений, повертає порожній словник."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        entries = data.get("entries")
+        return entries if isinstance(entries, dict) else {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def ai_cache_get(article, key):
+    entry = _cache_entries(_cache_path(article)).get(key)
+    if isinstance(entry, dict) and ai_valid(entry.get("ai")):
+        return entry["ai"]
+    return None
+
+
+def ai_cache_put(article, key, ai, model_used):
+    """Атомарно: пишемо в тимчасовий файл і підміняємо ним справжній. Збій запису не ламає генерацію."""
+    path = _cache_path(article)
+    tmp = None
+    try:
+        with _cache_file_lock:
+            entries = _cache_entries(path)
+            entries.pop(key, None)
+            entries[key] = {"saved": datetime.now().isoformat(timespec="seconds"),
+                            "prompt_version": PROMPT_VERSION, "model_used": model_used or "", "ai": ai}
+            while len(entries) > AI_CACHE_MAX_ENTRIES:       # найстаріші випадають першими
+                entries.pop(next(iter(entries)))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix="ai_cache.", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"version": 1, "entries": entries}, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, path)
+            tmp = None
+    except (OSError, TypeError, ValueError):
+        logging.warning("не вдалося зберегти кеш відповіді Gemini", exc_info=True)
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _truncated(data):
+    cands = data.get("candidates") or []
+    reason = cands[0].get("finishReason") if cands else None
+    return reason not in (None, "STOP")
+
+
+def ask_gemini_cached(p, parts, photo_hashes, prompt):
+    """Повертає нормалізовану відповідь Gemini: з кешу або новим запитом.
+    Один ключ за раз: другий потік чекає, а потім знову дивиться в кеш і не платить удруге."""
+    models = model_chain("GEMINI_MODEL", "gemini-3.8-flash")
+    key = ai_cache_key(p, photo_hashes, models[0], prompt)
+    with _key_lock(key):
+        ai = ai_cache_get(p["article"], key)
+        if ai is not None:
+            logging.getLogger("ads").info("AI-кеш: збіг, Gemini не викликаю (%s)", p["article"])
+            return ai
+        data = gemini_try(models, parts, json_mode=True)
+        ai = normalize_ai(parse_json(reply_text(data)))
+        if not _truncated(data) and ai_valid(ai):
+            ai_cache_put(p["article"], key, ai, data.get("modelVersion"))
+        return ai
+
+
 def make_listing(p, box, photo_paths):
-    """Запит до Gemini з фото. Повертає готові тексти полів."""
-    parts = [{"text": listing_prompt(p, box, len(photo_paths[:PHOTOS_TO_AI]))}]
+    """Запит до Gemini з фото (або з кешу, якщо такий самий уже був). Повертає готові тексти полів."""
+    photos = []
     for path in photo_paths[:PHOTOS_TO_AI]:
         with open(path, "rb") as f:
-            parts.append({"inline_data": {"mime_type": "image/jpeg",
-                                          "data": base64.b64encode(f.read()).decode()}})
-    data = gemini_try(model_chain("GEMINI_MODEL", "gemini-3.8-flash"), parts, json_mode=True)
-    ai = normalize_ai(parse_json(reply_text(data)))
+            photos.append(f.read())
+    prompt = listing_prompt(p, box, len(photos))
+    parts = [{"text": prompt}]
+    for raw in photos:
+        parts.append({"inline_data": {"mime_type": "image/jpeg",
+                                      "data": base64.b64encode(raw).decode()}})
+    ai = ask_gemini_cached(p, parts, [hashlib.sha256(raw).hexdigest() for raw in photos], prompt)
     shoes = is_shoes(p, ai)
     notes = []
     if ai["uncertain"]:

@@ -19,3 +19,5 @@ ads_usage.json
 *.backup
 __pycache__/
 *.pyc
+
+ads/
