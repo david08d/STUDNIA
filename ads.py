@@ -22,11 +22,11 @@ import statistics
 import tempfile
 import threading
 import time
+from contextlib import ExitStack
 from datetime import datetime
 
 import requests
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 import settings as config
 
 try:  # у новіших версіях бібліотеки прев'ю посилань вимикається так
@@ -549,22 +549,38 @@ def ai_cache_get(article, key):
     return None
 
 
-def ai_cache_put(article, key, ai, model_used):
-    """Атомарно: пишемо в тимчасовий файл і підміняємо ним справжній. Збій запису не ламає генерацію."""
+def ai_cache_latest(p):
+    """Остання збережена відповідь Gemini для цього артикула, незалежно від фото й моделі.
+    Підходить, якщо версія промпту та сама і для взуття відомі всі розміри, що зараз є на складі."""
+    want = B.norm_article(p["article"])
+    entries = _cache_entries(_cache_path(p["article"]))
+    for entry in reversed(list(entries.values())):          # спершу найновіші
+        if not isinstance(entry, dict) or entry.get("prompt_version") != PROMPT_VERSION:
+            continue
+        if entry.get("article", want) != want or not ai_valid(entry.get("ai")):
+            continue
+        ai = entry["ai"]
+        if ai["kind"] == "shoes" and any(B.norm_size(x) not in ai["sizes"] for x in p["sizes"]):
+            continue
+        return ai
+    return None
+
+
+def _cache_update(article, change):
+    """Читає файл кешу, передає дані у change(data) і атомарно записує назад (тимчасовий файл + заміна).
+    Збій запису не ламає генерацію."""
     path = _cache_path(article)
     tmp = None
     try:
         with _cache_file_lock:
-            entries = _cache_entries(path)
-            entries.pop(key, None)
-            entries[key] = {"saved": datetime.now().isoformat(timespec="seconds"),
-                            "prompt_version": PROMPT_VERSION, "model_used": model_used or "", "ai": ai}
-            while len(entries) > AI_CACHE_MAX_ENTRIES:       # найстаріші випадають першими
-                entries.pop(next(iter(entries)))
+            data = {"version": 1, "entries": _cache_entries(path)}
+            if ai_cache_last_box(article):
+                data["last_box"] = ai_cache_last_box(article)
+            change(data)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix="ai_cache.", suffix=".tmp")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump({"version": 1, "entries": entries}, f, ensure_ascii=False, indent=1)
+                json.dump(data, f, ensure_ascii=False, indent=1)
             os.replace(tmp, path)
             tmp = None
     except (OSError, TypeError, ValueError):
@@ -577,19 +593,62 @@ def ai_cache_put(article, key, ai, model_used):
                 pass
 
 
+def ai_cache_put(article, key, ai, model_used):
+    def change(data):
+        entries = data["entries"]
+        entries.pop(key, None)
+        entries[key] = {"saved": datetime.now().isoformat(timespec="seconds"),
+                        "article": B.norm_article(article), "prompt_version": PROMPT_VERSION,
+                        "model_used": model_used or "", "ai": ai}
+        while len(entries) > AI_CACHE_MAX_ENTRIES:       # найстаріші випадають першими
+            entries.pop(next(iter(entries)))
+    _cache_update(article, change)
+
+
+def ai_cache_last_box(article):
+    try:
+        with open(_cache_path(article), encoding="utf-8") as f:
+            box = json.load(f).get("last_box")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return box if box in ("with", "without") else None
+
+
+def remember_box(article, box):
+    """Запам'ятовує останній вибір «з коробкою / без», щоб автоматичне оголошення не питало про неї."""
+    if box not in ("with", "without") or ai_cache_last_box(article) == box:
+        return
+    if os.path.exists(_cache_path(article)):          # кешу ще немає: файл створювати не треба
+        _cache_update(article, lambda data: data.update(last_box=box))
+
+
+def saved_photos(article):
+    """Фото цього товару, які вже лежать у ads/<артикул>/ (01.jpg, 02.jpg...), за номерами."""
+    folder = folder_for(article)
+    try:
+        names = [f for f in os.listdir(folder) if re.fullmatch(r"\d+\.jpg", f)]
+    except OSError:
+        return []
+    names.sort(key=lambda f: int(f[:-4]))
+    return [os.path.join(folder, f) for f in names[:MAX_PHOTOS]]
+
+
 def _truncated(data):
     cands = data.get("candidates") or []
     reason = cands[0].get("finishReason") if cands else None
     return reason not in (None, "STOP")
 
 
-def ask_gemini_cached(p, parts, photo_hashes, prompt):
+def ask_gemini_cached(p, parts, photo_hashes, prompt, reuse_saved=False):
     """Повертає нормалізовану відповідь Gemini: з кешу або новим запитом.
-    Один ключ за раз: другий потік чекає, а потім знову дивиться в кеш і не платить удруге."""
+    Один ключ за раз: другий потік чекає, а потім знову дивиться в кеш і не платить удруге.
+    reuse_saved=True: якщо точного збігу немає, бере останню придатну відповідь для цього артикула."""
     models = model_chain("GEMINI_MODEL", "gemini-3.8-flash")
     key = ai_cache_key(p, photo_hashes, models[0], prompt)
     with _key_lock(key):
         ai = ai_cache_get(p["article"], key)
+        if ai is None and reuse_saved:
+            ai = ai_cache_latest(p)
         if ai is not None:
             logging.getLogger("ads").info("AI-кеш: збіг, Gemini не викликаю (%s)", p["article"])
             return ai
@@ -600,7 +659,7 @@ def ask_gemini_cached(p, parts, photo_hashes, prompt):
         return ai
 
 
-def make_listing(p, box, photo_paths):
+def make_listing(p, box, photo_paths, reuse_saved=False):
     """Запит до Gemini з фото (або з кешу, якщо такий самий уже був). Повертає готові тексти полів."""
     photos = []
     for path in photo_paths[:PHOTOS_TO_AI]:
@@ -611,7 +670,8 @@ def make_listing(p, box, photo_paths):
     for raw in photos:
         parts.append({"inline_data": {"mime_type": "image/jpeg",
                                       "data": base64.b64encode(raw).decode()}})
-    ai = ask_gemini_cached(p, parts, [hashlib.sha256(raw).hexdigest() for raw in photos], prompt)
+    ai = ask_gemini_cached(p, parts, [hashlib.sha256(raw).hexdigest() for raw in photos], prompt, reuse_saved)
+    remember_box(p["article"], box)
     shoes = is_shoes(p, ai)
     notes = []
     if ai["uncertain"]:
@@ -951,7 +1011,21 @@ async def _choose(context, chat_id, group):
     ad["product"] = p
     ad["photos"] = []
     ad["status_id"] = None
+    ad["auto"] = False
     await B.clear(context, "tmp")
+    photos = saved_photos(p["article"])
+    if not ad.get("busy") and (photos or ai_cache_latest(p)):
+        # Товар уже оброблявся: беремо фото з папки й збережену відповідь Gemini, питань про коробку й фото немає.
+        ad["photos"] = photos
+        ad["box"] = ai_cache_last_box(p["article"])
+        ad["auto"] = True
+        ad["busy"] = True
+        await B.say(context, chat_id,
+                    f"♻️ {esc(p['model'] or '—')} {esc(p['article'])}: беру збережені фото ({len(photos)}) "
+                    "і відповідь Gemini, якщо вона є.",
+                    parse_mode="HTML", kind="flash", seconds=6)
+        B.spawn(_generate_job(context, chat_id, ad))
+        return
     buy = f"\nЗакуп: від {p['buy_min']}₴" if p["buy_min"] else ""
     await B.say(context, chat_id,
                 f"✅ {esc(p['model'] or '—')} {esc(p['article'])}\n"
@@ -1124,7 +1198,43 @@ class _Ticker:
         self.stop.set()
         await self.task
 
+async def _send_ad_photos(context, chat_id, photos):
+    """Надсилає фото оголошення альбомами по 10 зображень."""
+    if not photos:
+        return
 
+    for start in range(0, len(photos), 10):
+        batch = photos[start:start + 10]
+
+        try:
+            if len(batch) == 1:
+                with open(batch[0], "rb") as photo:
+                    await context.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=photo,
+                    )
+            else:
+                with ExitStack() as stack:
+                    media = [
+                        InputMediaPhoto(
+                            media=stack.enter_context(open(path, "rb"))
+                        )
+                        for path in batch
+                    ]
+                    await context.bot.send_media_group(
+                        chat_id=chat_id,
+                        media=media,
+                    )
+        except Exception:
+            logging.exception("Не вдалося надіслати фото оголошення")
+            await B.say(
+                context,
+                chat_id,
+                "⚠️ Не вдалося надіслати фото в Telegram. Перевір логи бота.",
+                kind="flash",
+                seconds=10,
+            )
+            return
 async def _generate_job(context, chat_id, ad):
     """Генерація у фоні, щоб бот не «замерзав» і відповідав на кнопки."""
     try:
@@ -1163,7 +1273,8 @@ async def _generate(context, chat_id):
 
         async def listing_job():
             try:
-                return await asyncio.to_thread(make_listing, p, ad.get("box"), ad.get("photos", [])), ""
+                return await asyncio.to_thread(make_listing, p, ad.get("box"), ad.get("photos", []),
+                                             ad.get("auto", False)), ""
             except AdError as e:
                 return None, str(e)
 
@@ -1203,6 +1314,8 @@ async def _generate(context, chat_id):
         await B.say(context, chat_id, fields_text, kind="sticky", parse_mode="HTML", **NOPREVIEW)
         await B.say(context, chat_id, price_text(p, market, market_err), parse_mode="HTML",
                     reply_markup=price_keyboard(p, market), **NOPREVIEW)
+    if ad.get("photos"):
+        await _send_ad_photos(context, chat_id, ad["photos"])
 
 
 def _compose(ad, p, market, err):

@@ -221,6 +221,186 @@ class CacheTest(unittest.TestCase):
         with open(self.cache_file(), encoding="utf-8") as f:
             self.assertEqual(len(json.load(f)["entries"]), 5)
 
+    # --- автоматичне оголошення за артикулом ---
+    def test_saved_photos_sorted_by_number_and_filtered(self):
+        folder = ads.folder_for(self.p["article"])
+        os.makedirs(folder)
+        for name in ("10.jpg", "02.jpg", "01.jpg", "notes.txt", "03.png", "x.jpg"):
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(b"x")
+        self.assertEqual([os.path.basename(x) for x in ads.saved_photos(self.p["article"])],
+                         ["01.jpg", "02.jpg", "10.jpg"])
+        self.assertEqual(ads.saved_photos("NO-SUCH"), [])
+
+    def test_reuse_saved_ignores_photo_set_but_default_does_not(self):
+        self.make()
+        other = [self.photo("other.jpg", b"other")]
+        ads.make_listing(self.p, None, other)                       # звичайний шлях: інші фото = новий запит
+        self.assertEqual(self.calls, 2)
+        third = [self.photo("third.jpg", b"third")]
+        ads.make_listing(self.p, None, third, True)                 # автоматичний: бере збережену відповідь
+        self.assertEqual(self.calls, 2)
+
+    def test_reuse_saved_rules(self):
+        self.make()
+        self.assertIsNone(ads.ai_cache_latest(dict(self.p, article="OTHER-1")))
+        self.assertIsNone(ads.ai_cache_latest(dict(self.p, sizes=["38", "40", "41"])))
+        self.assertIsNotNone(ads.ai_cache_latest(dict(self.p, sizes=["40"])))
+        ads.PROMPT_VERSION += 1
+        self.assertIsNone(ads.ai_cache_latest(self.p))
+        new_photo = [self.photo("v.jpg", b"v")]
+        ads.make_listing(self.p, None, new_photo, True)             # відповідь неактуальна: новий запит
+        self.assertEqual(self.calls, 2)
+
+    def test_last_box_remembered(self):
+        self.make(box="without")
+        self.assertEqual(ads.ai_cache_last_box(self.p["article"]), "without")
+        self.make(box="with")
+        self.assertEqual(ads.ai_cache_last_box(self.p["article"]), "with")
+        self.make(box=None)
+        self.assertEqual(ads.ai_cache_last_box(self.p["article"]), "with")
+        self.make(photos=[self.photo("z.jpg", b"z")])
+        self.assertEqual(ads.ai_cache_last_box(self.p["article"]), "with")   # новий запис не губить коробку
+
+    def test_box_not_saved_without_cache_file(self):
+        self.response = reply(type_gender="")
+        self.make(box="with")
+        self.assertFalse(os.path.exists(self.cache_file()))
+        self.assertIsNone(ads.ai_cache_last_box(self.p["article"]))
+
+    def _flow(self, stock):
+        """Фальшивий bot-модуль, щоб проганяти текст і вибір товару без Telegram."""
+        import asyncio
+        from types import SimpleNamespace
+        out = SimpleNamespace(spawned=[], said=[], ctx=SimpleNamespace(user_data={"mode": "ad_article"}))
+
+        async def noop(*a, **k):
+            return None
+
+        async def say(ctx, chat, text, **k):
+            out.said.append((text, k))
+            return SimpleNamespace(message_id=1)
+
+        def spawn(coro):
+            out.spawned.append(coro)
+            coro.close()
+        out.B = SimpleNamespace(
+            safe_answer=noop, say=say, clear=noop, safe_delete=noop, spawn=spawn, track=lambda *a: None,
+            CANCEL_BTN=None, CANCEL_KB=None, norm_article=bot.norm_article, norm_size=bot.norm_size,
+            money=bot.money, load_stock=lambda: (stock, None))
+        out.update = SimpleNamespace(effective_chat=SimpleNamespace(id=1), message=SimpleNamespace(message_id=5))
+        out.send = lambda text: asyncio.run(ads.on_text(out.update, out.ctx, text))
+        return out
+
+    @staticmethod
+    def _row(article, model="Nike Air Max Bliss", size="38", qty=1):
+        return {"article": article, "model": model, "size": size, "qty": qty, "buy": "1000"}
+
+    def test_text_with_saved_photos_starts_generation_at_once(self):
+        flow = self._flow([self._row("DH5128-001"), self._row("DH5128-001", size="40")])
+        folder = ads.folder_for("DH5128-001")
+        os.makedirs(folder)
+        for n in ("01.jpg", "02.jpg"):
+            with open(os.path.join(folder, n), "wb") as f:
+                f.write(b"img")
+        try:
+            ads.B = flow.B
+            flow.send("DH5128-001")
+        finally:
+            ads.B = bot
+        ad = flow.ctx.user_data["ad"]
+        self.assertEqual(len(flow.spawned), 1)
+        self.assertTrue(ad["auto"] and ad["busy"])
+        self.assertEqual(len(ad["photos"]), 2)
+        self.assertEqual(len(flow.said), 1)                     # лише коротке повідомлення, питань нема
+        self.assertNotIn("Коробка", flow.said[0][0])
+
+    def test_text_with_saved_answer_but_no_photos_uses_remembered_box(self):
+        self.make(box="with", photos=[])                        # відповідь і коробка збережені
+        flow = self._flow([self._row("DH5128-001"), self._row("DH5128-001", size="40")])
+        try:
+            ads.B = flow.B
+            flow.send("dh5128")
+        finally:
+            ads.B = bot
+        ad = flow.ctx.user_data["ad"]
+        self.assertEqual(len(flow.spawned), 1)
+        self.assertEqual((ad["box"], ad["photos"], ad["auto"]), ("with", [], True))
+
+    def test_new_product_keeps_old_questions(self):
+        flow = self._flow([self._row("NEW-123")])
+        try:
+            ads.B = flow.B
+            flow.send("NEW-123")
+        finally:
+            ads.B = bot
+        ad = flow.ctx.user_data["ad"]
+        self.assertEqual(flow.spawned, [])
+        self.assertFalse(ad["auto"])
+        self.assertIn("Коробка", flow.said[0][0])
+
+    def test_several_matches_ask_to_choose(self):
+        flow = self._flow([self._row("DH5128-001"), self._row("DH5128-002", model="Nike Air Max Bliss 2")])
+        folder = ads.folder_for("DH5128-001")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "01.jpg"), "wb") as f:
+            f.write(b"img")
+        try:
+            ads.B = flow.B
+            flow.send("Air Max Bliss")
+        finally:
+            ads.B = bot
+        self.assertEqual(flow.spawned, [])                      # автоматично нічого не запущено
+        self.assertIn("кілька", flow.said[0][0])
+        self.assertEqual(len(flow.ctx.user_data["ad"]["cands"]), 2)
+
+    def test_busy_generation_falls_back_to_old_flow(self):
+        self.make()
+        flow = self._flow([self._row("DH5128-001"), self._row("DH5128-001", size="40")])
+        flow.ctx.user_data["ad"] = {"busy": True}
+        try:
+            ads.B = flow.B
+            flow.send("DH5128-001")
+        finally:
+            ads.B = bot
+        self.assertEqual(flow.spawned, [])
+        self.assertIn("Коробка", flow.said[0][0])
+
+    def test_generate_passes_auto_flag(self):
+        import asyncio
+        from types import SimpleNamespace
+        seen = {}
+
+        def fake_make(p, box, photos, reuse):
+            seen["args"] = (box, list(photos), reuse)
+            return {"title": "T", "description": "D", "keywords": "k", "info": "i", "notes": [],
+                    "brand": "Nike", "ai": {}, "shoes": True}
+
+        class Tk:
+            log = staticmethod(lambda s: None)
+
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        flow = self._flow([])
+        flow.ctx.user_data["ad"] = {"product": dict(self.p), "photos": ["/x/01.jpg"], "box": "with", "auto": True}
+        flow.ctx.bot = SimpleNamespace()
+        old = (ads.make_listing, ads._Ticker)
+        try:
+            ads.B = flow.B
+            ads.make_listing, ads._Ticker = fake_make, Tk
+            asyncio.run(ads._generate(flow.ctx, 1))
+        finally:
+            ads.B = bot
+            ads.make_listing, ads._Ticker = old
+        self.assertEqual(seen["args"], ("with", ["/x/01.jpg"], True))
+
 
 if __name__ == "__main__":
     unittest.main()
